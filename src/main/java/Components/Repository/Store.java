@@ -69,7 +69,10 @@ public class Store {
             LocalDateTime now = LocalDateTime.now();
             Value value = map.get(key);
 
-            if(value!=null && value.expiry.isBefore(now)){
+            if(value == null){
+                return "$-1\r\n";
+            }
+            if(value.expiry != null && !value.expiry.equals(LocalDateTime.MAX) && value.expiry.isBefore(now)){
                 map.remove(key);
                 return "$-1\r\n";
             }
@@ -86,9 +89,12 @@ public class Store {
         rwLock.readLock().lock();
         try{
             LocalDateTime now = LocalDateTime.now();
-            Value value = map.getOrDefault(key, null);
+            Value value = map.get(key);
 
-            if(value!=null && value.expiry.isBefore(now)){
+            if(value == null){
+                return null;
+            }
+            if(value.expiry != null && !value.expiry.equals(LocalDateTime.MAX) && value.expiry.isBefore(now)){
                 map.remove(key);
                 return null;
             }
@@ -98,6 +104,39 @@ public class Store {
             return null;
         }finally{
             rwLock.readLock().unlock();
+        }
+    }
+
+    public String incr(String key){
+        rwLock.writeLock().lock();
+        try{
+            LocalDateTime now = LocalDateTime.now();
+            Value value = map.get(key);
+
+            if(value != null && value.expiry != null && !value.expiry.equals(LocalDateTime.MAX) && value.expiry.isBefore(now)){
+                map.remove(key);
+                value = null;
+            }
+
+            if(value == null){
+                Value newValue = new Value("1", now, LocalDateTime.MAX);
+                map.put(key, newValue);
+                return respSerializer.respInteger(1);
+            }
+
+            try{
+                long val = Long.parseLong(value.val);
+                val++;
+                value.val = String.valueOf(val);
+                return respSerializer.respInteger((int) val);
+            } catch (NumberFormatException e) {
+                return "-ERR value is not an integer or out of range\r\n";
+            }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, e.getMessage());
+            return "-ERR value is not an integer or out of range\r\n";
+        }finally{
+            rwLock.writeLock().unlock();
         }
     }
 

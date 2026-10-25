@@ -48,27 +48,48 @@ public class Client {
         this.id = id;
     }
 
-    public void send(String res, byte[] data) throws IOException {
-        if(res !=null && !res.equals(""))
-            outputStream.write(res.getBytes());
+    public synchronized void send(String res, byte[] data) throws IOException {
+        if(res !=null && !res.isEmpty())
+            outputStream.write(res.getBytes(java.nio.charset.StandardCharsets.UTF_8));
         if(data!=null)
             outputStream.write(data);
+        outputStream.flush();
     }
 
-    public void send(ResponseDto res) throws IOException {
-        if(res.response !=null && !res.response.isEmpty())
-            outputStream.write(res.response.getBytes());
-        if(res.data!=null)
-            outputStream.write(res.data);
+    public synchronized void send(ResponseDto res) throws IOException {
+        if(res != null){
+            if(res.response !=null && !res.response.isEmpty())
+                outputStream.write(res.response.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            if(res.data!=null)
+                outputStream.write(res.data);
+            outputStream.flush();
+        }
     }
 
-    public void send(byte[] data) throws IOException {
-        if(data!=null)
+    public synchronized void send(byte[] data) throws IOException {
+        if(data!=null){
             outputStream.write(data);
+            outputStream.flush();
+        }
     }
 
-    public void send(String data) throws IOException {
-        if(data!=null && !data.isEmpty())
-            outputStream.write(data.getBytes());
+    public synchronized void send(String data) throws IOException {
+        if(data!=null && !data.isEmpty()){
+            outputStream.write(data.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            outputStream.flush();
+        }
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        Client client = (Client) o;
+        return id == client.id && java.util.Objects.equals(socket, client.socket);
+    }
+
+    @Override
+    public int hashCode() {
+        return java.util.Objects.hash(id, socket);
     }
 }

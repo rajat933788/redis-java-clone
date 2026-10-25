@@ -42,26 +42,25 @@ public class MasterTcpServer {
     private Store store;
     public void startServer(){
         ServerSocket serverSocket = null;
-        Socket clientSocket = null;
         int port = redisConfig.getPort();
         try {
             serverSocket = new ServerSocket(port);
             serverSocket.setReuseAddress(true);
             int id = 0;
-            while (true) {
-                clientSocket = serverSocket.accept();
+            while (!serverSocket.isClosed()) {
+                Socket clientSocket = serverSocket.accept();
                 id++;
                 Socket finalClientSocket = clientSocket;
 
                 InputStream inputStream = clientSocket.getInputStream();
                 OutputStream outputStream = clientSocket.getOutputStream();
 
-                Client client = new Client(finalClientSocket, inputStream, outputStream, id );
+                Client client = new Client(finalClientSocket, inputStream, outputStream, id);
                 CompletableFuture.runAsync(() -> {
                     try {
                         handleClient(client);
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
+                    } catch (Exception e) {
+                        logger.log(Level.INFO, "Client handler exception: " + e.getMessage());
                     }
                 });
             }
@@ -70,52 +69,64 @@ public class MasterTcpServer {
             logger.log(Level.SEVERE, e.getMessage());
         } finally {
             try {
-                if (clientSocket != null) {
-                    clientSocket.close();
+                if (serverSocket != null && !serverSocket.isClosed()) {
+                    serverSocket.close();
                 }
             } catch (IOException e) {
                 logger.log(Level.SEVERE, e.getMessage());
             }
         }
     }
+
     private void handleClient(Client client) throws IOException {
         connectionPool.addClient(client);
-        while(client.socket.isConnected()){
-            byte[] buffer = new byte[client.socket.getReceiveBufferSize()];
-            int bytesRead = client.inputStream.read(buffer);
-
-            if(bytesRead > 0){
-                // bytes parsing into strings
-                List<String[]> commands = respSerializer.deseralize(buffer);
-
-                for(String[] command :commands){
-                    handleCommand(command, client);
+        try {
+            byte[] buffer = new byte[8192];
+            while (!client.socket.isClosed()) {
+                int bytesRead = client.inputStream.read(buffer);
+                if (bytesRead == -1) {
+                    break;
+                }
+                if (bytesRead > 0) {
+                    List<String[]> commands = respSerializer.deserialize(buffer, bytesRead);
+                    for (String[] command : commands) {
+                        handleCommand(command, client);
+                    }
                 }
             }
+        } catch (IOException e) {
+            logger.log(Level.FINE, "Client connection closed: " + e.getMessage());
+        } finally {
+            try {
+                client.socket.close();
+            } catch (IOException ignored) {}
+            connectionPool.removeClient(client);
+            connectionPool.removeSlave(client);
         }
-        connectionPool.removeClient(client);
-        connectionPool.removeSlave(client);
     }
 
     private void handleCommand(String[] command, Client client) throws IOException {
-        if(!client.getTransactionalContext()){
+        if (command == null || command.length == 0) {
+            return;
+        }
+        String cmd = command[0].toUpperCase();
+        if (!client.getTransactionalContext()) {
             ResponseDto responseDto = caseHandler(command, client);
             client.send(responseDto);
-        }else if(!isTransactionalControlCommand(command[0])){
-            // we are in the transactional context and the command is a normal command
+        } else if ("MULTI".equals(cmd)) {
+            client.send("-ERR MULTI calls can not be nested\r\n");
+        } else if (!isTransactionalControlCommand(cmd)) {
             addCommandToTransaction(command, client);
-        }else{
-            // we are in the transactional context and the command is a transaction control command, EXEC or DISCARD
+        } else {
             transactionController(command, client);
         }
-
     }
 
     private void transactionController(String[] command, Client client) throws IOException {
-        //control only comes here in the transaction context
-        switch (command[0]){
+        String cmd = command[0].toUpperCase();
+        switch (cmd){
             case "EXEC":
-                if(client.commandQueue==null || client.commandQueue.isEmpty()){
+                if(client.commandQueue == null || client.commandQueue.isEmpty()){
                     client.send("*0\r\n");
                     client.endTransaction();
                     return;
@@ -123,23 +134,23 @@ public class MasterTcpServer {
 
                 Queue<String[]> commands = new LinkedList<>(client.commandQueue);
 
-                //execute the transaction
                 BiFunction<String[], Map<String, Value>, String> transactionCacheApplier = commandHandler.getTransactionCommandCacheApplier();
                 store.executeTransaction(client, transactionCacheApplier);
 
                 client.endTransaction();
                 while(!commands.isEmpty()){
                     String[] commandToPropagate = commands.poll();
-                    String commandRespString = respSerializer.respArray(commandToPropagate);
-                    byte[] toCount = commandRespString.getBytes();
-                    connectionPool.bytesSentToSlaves += toCount.length;
-                    CompletableFuture.runAsync(()->propagate(commandToPropagate));
+                    String action = commandToPropagate[0].toUpperCase();
+                    if ("SET".equals(action) || "INCR".equals(action) || "DEL".equals(action)) {
+                        String commandRespString = respSerializer.respArray(commandToPropagate);
+                        byte[] toCount = commandRespString.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                        connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
+                        CompletableFuture.runAsync(() -> propagate(commandToPropagate));
+                    }
                 }
 
                 String response = respSerializer.respArray(client.transactionResponse);
-
                 client.send(response);
-
                 break;
             case "DISCARD":
                 client.endTransaction();
@@ -154,17 +165,17 @@ public class MasterTcpServer {
     }
 
     private boolean isTransactionalControlCommand(String command) {
-        return switch (command) {
+        return switch (command.toUpperCase()) {
             case "EXEC", "DISCARD" -> true;
             default -> false;
         };
     }
 
     public ResponseDto caseHandler(String[] command, Client client){
-        //control comes here only when the client is not in a transaction
         String res = "";
         byte[] data = null;
-        switch (command[0]){
+        String cmd = command[0].toUpperCase();
+        switch (cmd){
             case "PING":
                 res = commandHandler.ping(command);
                 break;
@@ -180,6 +191,12 @@ public class MasterTcpServer {
                 break;
             case "INCR":
                 res = commandHandler.incr(command);
+                if (res.startsWith(":")) {
+                    String commandRespString = respSerializer.respArray(command);
+                    byte[] toCount = commandRespString.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
+                    CompletableFuture.runAsync(() -> propagate(command));
+                }
                 break;
             case "ECHO":
                 res = commandHandler.echo(command);
@@ -187,9 +204,9 @@ public class MasterTcpServer {
             case "SET":
                 res = commandHandler.set(command);
                 String commandRespString = respSerializer.respArray(command);
-                byte[] toCount = commandRespString.getBytes();
-                connectionPool.bytesSentToSlaves += toCount.length;
-                CompletableFuture.runAsync(()->propagate(command));
+                byte[] toCount = commandRespString.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                connectionPool.bytesSentToSlaves.addAndGet(toCount.length);
+                CompletableFuture.runAsync(() -> propagate(command));
                 break;
             case "GET":
                 res = commandHandler.get(command);
@@ -201,38 +218,30 @@ public class MasterTcpServer {
                 res = commandHandler.replconf(command, client);
                 break;
             case "WAIT":
-                if(connectionPool.bytesSentToSlaves == 0){
-                    res = respSerializer.respInteger(connectionPool.slavesThatAreCaughtUp);
-                    break;
-                }
                 Instant start = Instant.now();
                 res = commandHandler.wait(command, start);
-                connectionPool.slavesThatAreCaughtUp = 0;
                 break;
             case "PSYNC":
                 ResponseDto resDto = commandHandler.psync(command);
                 res = resDto.response;
                 data = resDto.data;
                 break;
+            default:
+                res = "-ERR unknown command '" + command[0] + "'\r\n";
+                break;
         }
         return new ResponseDto(res, data);
     }
 
-
     private void propagate(String[] command) {
         String commandRespString = respSerializer.respArray(command);
-        try{
-            for(Slave slave: connectionPool.getSlaves()){
-                System.out.println("========================= sending command down to slave ==============================");
-                System.out.println("command: "+commandRespString);
-                System.out.println(slave.connection.id);
-                InetAddress remoteAddress = slave.connection.socket.getInetAddress();
-                System.out.println("Remote IP address: " + remoteAddress.getHostAddress() +": "+slave.connection.socket.getPort());
-
-                slave.send(commandRespString.getBytes());
+        byte[] bytes = commandRespString.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        for(Slave slave: connectionPool.getSlaves()){
+            try {
+                slave.send(bytes);
+            } catch (IOException e) {
+                logger.log(Level.WARNING, "Failed to send command to slave: " + e.getMessage());
             }
-        } catch (IOException e) {
-            throw new RuntimeException(e);
         }
     }
 }
